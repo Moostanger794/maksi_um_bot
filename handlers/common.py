@@ -54,8 +54,9 @@ async def prices_info(callback: CallbackQuery, config: Config) -> None:
 
 @router.callback_query(F.data == "info:gallery")
 async def gallery(callback: CallbackQuery, config: Config) -> None:
-    await callback.message.edit_text(
-        "Фотогалерея центра:",
+    await callback.message.answer(
+        f"Фотогалерея центра:\n{config.gallery_url}",
+        disable_web_page_preview=True,
         reply_markup=gallery_kb(config.gallery_url),
     )
     await callback.answer()

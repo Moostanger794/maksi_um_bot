@@ -11,6 +11,8 @@ from keyboards.inline import admin_panel_kb
 from scheduler.reminders import ReminderService
 
 router = Router()
+_pending_slot_selection: dict[tuple[int, str], set[str]] = {}
+_pending_remove_selection: dict[tuple[int, str], set[str]] = {}
 
 
 def _is_admin(user_id: int, config: Config) -> bool:
@@ -29,6 +31,15 @@ async def admin_panel(callback: CallbackQuery, config: Config) -> None:
 def _month_window() -> tuple[date, date]:
     start = date.today()
     return start, start + timedelta(days=30)
+
+
+def _half_hour_times() -> list[str]:
+    times: list[str] = []
+    for hour in range(8, 21):
+        times.append(f"{hour:02d}:00")
+        if hour != 20:
+            times.append(f"{hour:02d}:30")
+    return times
 
 
 def _admin_calendar(action: str, month: int, year: int) -> object:
@@ -102,11 +113,42 @@ def _time_buttons(action: str, date_iso: str, times: list[str]) -> object:
     return kb.as_markup()
 
 
+def _add_multi_slots_kb(user_id: int, date_iso: str) -> object:
+    selected = _pending_slot_selection.get((user_id, date_iso), set())
+    kb = InlineKeyboardBuilder()
+    for t in _half_hour_times():
+        encoded = t.replace(":", "")
+        mark = "✅ " if t in selected else ""
+        kb.button(text=f"{mark}{t}", callback_data=f"admadd:tg:{date_iso}:{encoded}")
+
+    kb.button(text="Выбрать все", callback_data=f"admadd:all:{date_iso}")
+    kb.button(text="Очистить", callback_data=f"admadd:clr:{date_iso}")
+    kb.button(text="✅ Сохранить выбранные", callback_data=f"admadd:sv:{date_iso}")
+    kb.button(text="🔙 Админ", callback_data="admin:panel")
+    kb.adjust(3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 1, 1)
+    return kb.as_markup()
+
+
+def _remove_multi_slots_kb(user_id: int, date_iso: str, existing_times: list[str]) -> object:
+    selected = _pending_remove_selection.get((user_id, date_iso), set())
+    kb = InlineKeyboardBuilder()
+    for t in existing_times:
+        encoded = t.replace(":", "")
+        mark = "✅ " if t in selected else ""
+        kb.button(text=f"{mark}{t}", callback_data=f"admrm:tg:{date_iso}:{encoded}")
+
+    kb.button(text="Выбрать все", callback_data=f"admrm:all:{date_iso}")
+    kb.button(text="Очистить", callback_data=f"admrm:clr:{date_iso}")
+    kb.button(text="🗑 Удалить выбранные", callback_data=f"admrm:sv:{date_iso}")
+    kb.button(text="🔙 Админ", callback_data="admin:panel")
+    kb.adjust(3, 3, 3, 3, 3, 3, 3, 3, 2, 1, 1)
+    return kb.as_markup()
+
+
 @router.callback_query(F.data.startswith("adminpick:") & F.data.contains(":date:"))
 async def admin_pick_date(
     callback: CallbackQuery,
     db: Database,
-    reminders: ReminderService,
     config: Config,
 ) -> None:
     if not _is_admin(callback.from_user.id, config):
@@ -130,19 +172,20 @@ async def admin_pick_date(
                 lines.append(f"#{b['id']} | {b['slot_time']} | {b['child_name']} ({b['parent_name']}) | {b['phone']}")
             await callback.message.edit_text("\n".join(lines), reply_markup=admin_panel_kb())
     elif action == "add_slot":
-        times = [f"{h:02d}:00" for h in range(9, 21)]
+        _pending_slot_selection[(callback.from_user.id, date_iso)] = set()
         await callback.message.edit_text(
-            f"Добавление слота на {date_iso}. Выберите время:",
-            reply_markup=_time_buttons(action, date_iso, times),
+            f"Добавление слотов на {date_iso}.\nВыберите одно или несколько времен (шаг 30 минут):",
+            reply_markup=_add_multi_slots_kb(callback.from_user.id, date_iso),
         )
     elif action == "remove_slot":
         times = db.get_slots_for_date(date_iso)
         if not times:
             await callback.message.edit_text("На эту дату слотов нет.", reply_markup=admin_panel_kb())
         else:
+            _pending_remove_selection[(callback.from_user.id, date_iso)] = set()
             await callback.message.edit_text(
-                f"Удаление слота на {date_iso}. Выберите время:",
-                reply_markup=_time_buttons(action, date_iso, times),
+                f"Удаление слотов на {date_iso}.\nВыберите одно или несколько времен:",
+                reply_markup=_remove_multi_slots_kb(callback.from_user.id, date_iso, times),
             )
     elif action == "cancel_client":
         bookings = db.get_date_bookings(date_iso)
@@ -158,6 +201,138 @@ async def admin_pick_date(
             kb.button(text="🔙 Админ", callback_data="admin:panel")
             kb.adjust(1)
             await callback.message.edit_text("Выберите запись для отмены:", reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admrm:"))
+async def admin_remove_multi_slots(callback: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    action = parts[1]
+    date_iso = parts[2]
+    key = (callback.from_user.id, date_iso)
+    existing = db.get_slots_for_date(date_iso)
+    selected = _pending_remove_selection.setdefault(key, set())
+
+    if action == "tg":
+        hhmm = parts[3]
+        time_str = f"{hhmm[:2]}:{hhmm[2:]}"
+        if time_str in selected:
+            selected.remove(time_str)
+        else:
+            selected.add(time_str)
+        await callback.message.edit_text(
+            f"Удаление слотов на {date_iso}.\nВыбрано: {len(selected)}",
+            reply_markup=_remove_multi_slots_kb(callback.from_user.id, date_iso, existing),
+        )
+        await callback.answer()
+        return
+
+    if action == "all":
+        _pending_remove_selection[key] = set(existing)
+        await callback.message.edit_text(
+            f"Удаление слотов на {date_iso}.\nВыбрано: {len(_pending_remove_selection[key])}",
+            reply_markup=_remove_multi_slots_kb(callback.from_user.id, date_iso, existing),
+        )
+        await callback.answer("Выбраны все слоты")
+        return
+
+    if action == "clr":
+        _pending_remove_selection[key] = set()
+        await callback.message.edit_text(
+            f"Удаление слотов на {date_iso}.\nВыбрано: 0",
+            reply_markup=_remove_multi_slots_kb(callback.from_user.id, date_iso, existing),
+        )
+        await callback.answer("Выбор очищен")
+        return
+
+    if action == "sv":
+        if not selected:
+            await callback.answer("Не выбрано ни одного времени.", show_alert=True)
+            return
+
+        removed = 0
+        for t in sorted(selected):
+            before = set(db.get_slots_for_date(date_iso))
+            db.remove_slot(date_iso, t)
+            after = set(db.get_slots_for_date(date_iso))
+            if t in before and t not in after:
+                removed += 1
+
+        total = len(selected)
+        _pending_remove_selection.pop(key, None)
+        await callback.message.edit_text(
+            f"Удаление завершено.\nУдалено: {removed}\nНе удалено (занятые/отсутствуют): {total - removed}",
+            reply_markup=admin_panel_kb(),
+        )
+        await callback.answer("Готово")
+        return
+
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admadd:"))
+async def admin_add_multi_slots(callback: CallbackQuery, db: Database, config: Config) -> None:
+    if not _is_admin(callback.from_user.id, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    action = parts[1]
+    date_iso = parts[2]
+    key = (callback.from_user.id, date_iso)
+    selected = _pending_slot_selection.setdefault(key, set())
+
+    if action == "tg":
+        hhmm = parts[3]
+        time_str = f"{hhmm[:2]}:{hhmm[2:]}"
+        if time_str in selected:
+            selected.remove(time_str)
+        else:
+            selected.add(time_str)
+        await callback.message.edit_text(
+            f"Добавление слотов на {date_iso}.\nВыбрано: {len(selected)}",
+            reply_markup=_add_multi_slots_kb(callback.from_user.id, date_iso),
+        )
+        await callback.answer()
+        return
+
+    if action == "all":
+        _pending_slot_selection[key] = set(_half_hour_times())
+        await callback.message.edit_text(
+            f"Добавление слотов на {date_iso}.\nВыбрано: {len(_pending_slot_selection[key])}",
+            reply_markup=_add_multi_slots_kb(callback.from_user.id, date_iso),
+        )
+        await callback.answer("Выбраны все слоты")
+        return
+
+    if action == "clr":
+        _pending_slot_selection[key] = set()
+        await callback.message.edit_text(
+            f"Добавление слотов на {date_iso}.\nВыбрано: 0",
+            reply_markup=_add_multi_slots_kb(callback.from_user.id, date_iso),
+        )
+        await callback.answer("Выбор очищен")
+        return
+
+    if action == "sv":
+        if not selected:
+            await callback.answer("Не выбрано ни одного времени.", show_alert=True)
+            return
+        for t in sorted(selected):
+            db.add_slot(date_iso, t)
+        added_count = len(selected)
+        _pending_slot_selection.pop(key, None)
+        await callback.message.edit_text(
+            f"Добавлено слотов на {date_iso}: {added_count}",
+            reply_markup=admin_panel_kb(),
+        )
+        await callback.answer("Слоты сохранены")
+        return
+
     await callback.answer()
 
 
